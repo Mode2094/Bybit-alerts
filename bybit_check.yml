@@ -1,0 +1,117 @@
+name: Bybit Price Alerter
+
+# هذا هو المؤقت: سيتم تشغيل الكود كل 5 دقائق
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # يسمح لك بتشغيله يدوياً
+
+jobs:
+  check-prices:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Bybit Check
+        # سنقوم بتشغيل سكربت بايثون صغير هنا مباشرة
+        # هذا السكربت يستخدم الأسرار (Secrets) لإرسال رسالة تليجرام
+        run: |
+          import requests
+          import os
+          import json
+
+          API_URL = "https://api.bybit.com/v5/market/tickers?category=spot"
+          TARGET_PERCENT = 0.05  # 5% (يمكنك تغيير هذا الرقم هنا إذا أردت)
+          
+          # مسار الملف الذي يخزن العملات التي تم التنبيه لها
+          # هذا الملف يتم حفظه بين التشغيلات
+          STATE_FILE = 'alerted_symbols.json'
+
+          # جلب الأسرار من GitHub
+          BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+          CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
+
+          def load_alerted_symbols():
+              if not os.path.exists(STATE_FILE):
+                  return set()
+              try:
+                  with open(STATE_FILE, 'r') as f:
+                      return set(json.load(f))
+              except (IOError, json.JSONDecodeError):
+                  return set()
+
+          def save_alerted_symbols(symbols_set):
+              try:
+                  with open(STATE_FILE, 'w') as f:
+                      json.dump(list(symbols_set), f)
+              except IOError:
+                  pass # لا يمكن فعل الكثير في بيئة 'serverless'
+
+          def send_telegram_message(message):
+              url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+              payload = {'chat_id': CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
+              try:
+                  requests.post(url, json=payload, timeout=5)
+                  print(f"Sent message: {message}")
+              except Exception as e:
+                  print(f"Failed to send Telegram message: {e}")
+
+          # --- المنطق الرئيسي ---
+          alerted_symbols = load_alerted_symbols()
+          new_alerts_found = False
+          
+          try:
+              response = requests.get(API_URL, timeout=10)
+              data = response.json()
+              
+              if data.get('retCode') == 0:
+                  for ticker in data.get('result', {}).get('list', []):
+                      symbol = ticker.get('symbol', '')
+                      if not symbol.endswith('USDT'):
+                          continue
+                      
+                      try:
+                          change_percent = float(ticker.get('price24hPcnt', '0'))
+                      except ValueError:
+                          continue
+
+                      if change_percent >= TARGET_PERCENT:
+                          if symbol not in alerted_symbols:
+                              percent_formatted = change_percent * 100
+                              message = f"🚀 *تنبيه Bybit* 🚀\n\nعملة: *{symbol}*\nارتفعت بنسبة: *{percent_formatted:.2f}%*\nالسعر: {ticker.get('lastPrice', 'N/A')}"
+                              send_telegram_message(message)
+                              alerted_symbols.add(symbol)
+                              new_alerts_found = True
+              else:
+                  print(f"API Error: {data.get('retMsg')}")
+
+          except Exception as e:
+              print(f"Script Error: {e}")
+
+          if new_alerts_found:
+              save_alerted_symbols(alerted_symbols)
+              print("Saved updated symbols list.")
+          else:
+              print("No new symbols found.")
+
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Commit state file
+        # هذه الخطوة مهمة لحفظ الملف الذي يحتوي على العملات
+        run: |
+          git config --global user.name 'github-actions'
+          git config --global user.email 'github-actions@github.com'
+          git add alerted_symbols.json
+          # Commit فقط إذا كان هناك تغييرات
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update alerted symbols state" && git push)
