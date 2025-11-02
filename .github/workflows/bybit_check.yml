@@ -1,1 +1,108 @@
+name: Bybit Price Alerter
 
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check-prices:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Bybit Check
+        run: |
+          python3 << 'EOF'
+          import requests
+          import os
+          import json
+
+          API_URL = "https://api.bybit.com/v5/market/tickers?category=spot"
+          TARGET_PERCENT = 0.05
+          STATE_FILE = 'alerted_symbols.json'
+
+          BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+          CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
+
+          def load_alerted_symbols():
+              if not os.path.exists(STATE_FILE):
+                  return set()
+              try:
+                  with open(STATE_FILE, 'r') as f:
+                      return set(json.load(f))
+              except:
+                  return set()
+
+          def save_alerted_symbols(symbols_set):
+              try:
+                  with open(STATE_FILE, 'w') as f:
+                      json.dump(list(symbols_set), f)
+              except:
+                  pass
+
+          def send_telegram_message(message):
+              url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+              payload = {'chat_id': CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
+              try:
+                  requests.post(url, json=payload, timeout=5)
+                  print("→ Telegram sent:", message)
+              except Exception as e:
+                  print("Telegram error:", e)
+
+          alerted_symbols = load_alerted_symbols()
+          new_alerts = False
+
+          try:
+              response = requests.get(API_URL, timeout=10)
+              data = response.json()
+
+              if data.get("retCode") == 0:
+                  for t in data.get("result", {}).get("list", []):
+                      symbol = t.get("symbol", "")
+                      if not symbol.endswith("USDT"):
+                          continue
+
+                      try:
+                          change_percent = float(t.get("price24hPcnt", "0"))
+                      except:
+                          continue
+
+                      if change_percent >= TARGET_PERCENT:
+                          if symbol not in alerted_symbols:
+                              percent_formatted = change_percent * 100
+                              msg = f"🚀 *تنبيه Bybit*\n\nعملة: *{symbol}*\nالارتفاع: *{percent_formatted:.2f}%*\nالسعر: {t.get('lastPrice', 'N/A')}"
+                              send_telegram_message(msg)
+                              alerted_symbols.add(symbol)
+                              new_alerts = True
+              else:
+                  print("API error:", data.get("retMsg"))
+          except Exception as e:
+              print("Script error:", e)
+
+          if new_alerts:
+              save_alerted_symbols(alerted_symbols)
+              print("Saved updated symbols")
+          else:
+              print("No new signals")
+          EOF
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Commit state file
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add alerted_symbols.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update alerted symbols state" && git push)
